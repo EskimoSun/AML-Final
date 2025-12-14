@@ -1,15 +1,32 @@
 import json
 import logging
+import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
+import requests
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _ensure_utf8_output() -> None:
+    """Force UTF-8 stdout/stderr to avoid codec errors on GBK consoles."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfig = getattr(stream, "reconfigure", None)
+        if callable(reconfig):  # pragma: no cover - environment dependent
+            try:
+                reconfig(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 - best effort guard
+                pass
+
+
+_ensure_utf8_output()
 
 
 @dataclass
@@ -61,16 +78,29 @@ class LLMClient:
             logger.warning("No API key provided; falling back to mock LLM output")
             # Provide deterministic minimal JSON to keep pipeline running
             return "MOCK"
-        base_url = None
-        if self.provider.lower() == "deepseek":
+        provider = self.provider.lower()
+        if provider == "deepseek":
             base_url = "https://api.deepseek.com"
-        client = OpenAI(api_key=self.api_key, base_url=base_url)
-        resp = client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content
+        else:
+            base_url = "https://api.openai.com"
+
+        url = f"{base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception as exc:  # pragma: no cover - network/HTTP handling
+            raise RuntimeError(f"LLM request failed: {exc}") from exc
 
 
 class SolverAgent:
@@ -97,11 +127,17 @@ Problem:\n{question}\n\nTests:{tests}\n\nStarter code:{starter_code}\n\nRetrieve
             data = json.loads(raw)
         except json.JSONDecodeError:
             raise ValueError(f"SolverAgent did not return valid JSON: {raw}")
+        complexity_claim = data.get("complexity_claim", {})
+        if not isinstance(complexity_claim, dict):
+            complexity_claim = {}
+        assumptions = data.get("assumptions", [])
+        if not isinstance(assumptions, list):
+            assumptions = []
         return SolverResult(
             code=data.get("code", ""),
             approach=data.get("approach", ""),
-            assumptions=data.get("assumptions", []) if isinstance(data.get("assumptions"), list) else [],
-            complexity_claim=data.get("complexity_claim", {}),
+            assumptions=assumptions,
+            complexity_claim=complexity_claim,
             changed_from_last=data.get("changed_from_last", ""),
         )
 
@@ -260,10 +296,21 @@ def parse_tests(input_output_raw: Any) -> Dict[str, List[str]]:
             parsed = json.loads(input_output_raw)
         except json.JSONDecodeError as exc:
             raise ValueError(f"input_output string must be valid JSON: {exc}")
+        # Some payloads may be doubly string-encoded (string containing JSON string)
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "input_output string contained nested JSON that could not be parsed: "
+                    f"{exc}"
+                )
     elif isinstance(input_output_raw, dict):
         parsed = input_output_raw
     else:
         raise ValueError("input_output must be string or dict")
+    if not isinstance(parsed, dict):
+        raise ValueError("input_output must decode to an object/dict")
     if "inputs" not in parsed or "outputs" not in parsed:
         raise ValueError("input_output missing inputs/outputs")
     inputs = parsed.get("inputs")
