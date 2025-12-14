@@ -17,7 +17,7 @@ pip install -r requirements.txt
 ## Build reference artifacts (one-time)
 Log schema validation and export a small reference set plus TF-IDF index.
 ```bash
-python scripts/build_reference_db.py --split test --limit 500
+python scripts/build_reference_db.py --split train --limit 500
 python scripts/build_tfidf_index.py
 ```
 If your environment cannot reach Hugging Face directly, use the bundled offline stub:
