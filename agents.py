@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,24 @@ import requests
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+def safe_json_loads(raw: str) -> dict:
+    """Parse JSON even if wrapped in ```json ...``` or with extra text around it."""
+    if raw is None:
+        raise ValueError("Empty LLM response (None).")
+    s = raw.strip()
+    m = _JSON_FENCE_RE.search(s)
+    if m:
+        s = m.group(1).strip()
+    if not s.startswith("{"):
+        l = s.find("{")
+        r = s.rfind("}")
+        if l != -1 and r != -1 and r > l:
+            s = s[l:r+1].strip()
+    return json.loads(s)
+
 
 
 def _ensure_utf8_output() -> None:
@@ -67,40 +86,146 @@ class Guide:
 
 
 class LLMClient:
-    def __init__(self, provider: str, api_key: Optional[str] = None, model: Optional[str] = None):
-        self.provider = provider
-        self.api_key = api_key
-        self.model = model or ("deepseek-chat" if provider.lower() == "deepseek" else "gpt-4o-mini")
-        self.mock_mode = api_key is None or api_key.strip() == ""
+    """
+    Minimal OpenAI-compatible client wrapper.
 
-    def complete(self, prompt: str) -> str:
+    DeepSeek is OpenAI-API compatible. Per DeepSeek docs, use:
+      - base_url: https://api.deepseek.com  (or /v1)
+      - model: deepseek-chat (cheapest, non-thinking) or deepseek-reasoner (thinking)
+    """
+    def __init__(
+        self,
+        provider: str,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ):
+        self.provider = provider.lower().strip()
+        self.api_key = (api_key or "").strip()
+        # Allow env var usage by default (recommended to avoid putting keys on CLI)
+        if not self.api_key:
+            if self.provider == "deepseek":
+                self.api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+            elif self.provider == "openai":
+                self.api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+
+        # Cheapest DeepSeek model is deepseek-chat (non-thinking). Use it by default.
+        if self.provider == "deepseek":
+            self.model = model or "deepseek-chat"
+            # DeepSeek docs recommend https://api.deepseek.com (or /v1 for OpenAI compatibility)
+            self.base_url = base_url or "https://api.deepseek.com"
+        else:
+            self.model = model or "gpt-4o-mini"
+            self.base_url = base_url  # None means OpenAI default in SDK
+
+        self.mock_mode = not self.api_key
+
+        # Lazily created SDK client (so unit tests without openai installed can still import)
+        self._client = None
+
+    def _get_client(self):
+        if self._client is not None:
+            return self._client
+        if self.mock_mode:
+            return None
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(
+                "Missing dependency 'openai'. Install with: pip install -U openai"
+            ) from exc
+
+        if self.provider == "deepseek":
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        elif self.provider == "openai":
+            # For OpenAI, base_url should typically be omitted
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url) if self.base_url else OpenAI(api_key=self.api_key)
+        else:
+            raise ValueError(f"Unsupported provider: {self.provider}")
+        return self._client
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> str:
+        """
+        Send a single-turn prompt and return the assistant content.
+
+        json_mode=True enables DeepSeek JSON Output (response_format={'type':'json_object'}).
+        DeepSeek docs also require the word 'json' to appear in the prompt when json_mode=True.
+        """
         if self.mock_mode:
             logger.warning("No API key provided; falling back to mock LLM output")
-            # Provide deterministic minimal JSON to keep pipeline running
             return "MOCK"
-        provider = self.provider.lower()
-        if provider == "deepseek":
-            base_url = "https://api.deepseek.com"
-        else:
-            base_url = "https://api.openai.com"
 
-        url = f"{base_url}/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
+        client = self._get_client()
+        assert client is not None
+
+        messages = [{"role": "user", "content": prompt}]
+
+        kwargs = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
         }
+
+        if json_mode:
+            # DeepSeek JSON Output mode
+            kwargs["response_format"] = {"type": "json_object"}
+
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-        except Exception as exc:  # pragma: no cover - network/HTTP handling
+            resp = client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content or ""
+        except Exception as exc:  # pragma: no cover
             raise RuntimeError(f"LLM request failed: {exc}") from exc
+        
+    # PATCH: handling sporatical empty content error from DeepSeek
+    def complete_with_retry(
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        temperature: float = 0.2,
+        max_tokens: int = 1600,
+        max_retries: int = 2,
+        min_temperature: float = 0.05,
+        backoff_base: float = 0.6,
+    ) -> str:
+        """
+        Minimal robust retry wrapper:
+        - Retries on any exception / empty output
+        - Lowers temperature each retry to increase determinism
+        - Never crashes the whole batch; caller can fallback if needed
+        """
+        last_err: Exception | None = None
+        t = float(temperature)
+
+        for attempt in range(max_retries + 1):
+            try:
+                raw = self.complete(
+                    prompt,
+                    json_mode=json_mode,
+                    temperature=t,
+                    max_tokens=max_tokens,
+                )
+                if not isinstance(raw, str) or not raw.strip():
+                    raise ValueError("Empty model output")
+                return raw
+            except Exception as e:
+                last_err = e
+                # cool down for next try
+                t = max(min_temperature, t * 0.5)
+                # exponential backoff (small)
+                time.sleep(min(3.0, backoff_base * (2 ** attempt)))
+
+        # If still failing, re-raise so SolverAgent can fallback cleanly
+        raise RuntimeError(f"LLM failed after retries: {last_err}") from last_err
+
 
 
 class SolverAgent:
@@ -113,7 +238,13 @@ class SolverAgent:
 You are SolverAgent. Write a full Python program for the problem. Use retrieved hints as guidance only. Output strict JSON with keys code, approach, assumptions, complexity_claim, changed_from_last.
 Problem:\n{question}\n\nTests:{tests}\n\nStarter code:{starter_code}\n\nRetrieved hints:{retrieval_text}\n\nPrevious fix request:{prev_fix or ''}
 """
-        raw = self.llm.complete(prompt)
+        raw = self.llm.complete_with_retry(
+            prompt,
+            json_mode=True,
+            temperature=0.2,
+            max_tokens=1600,
+            max_retries=2,
+        )
         if raw == "MOCK":
             code = self._mock_code(tests)
             return SolverResult(
@@ -124,9 +255,10 @@ Problem:\n{question}\n\nTests:{tests}\n\nStarter code:{starter_code}\n\nRetrieve
                 changed_from_last="(mock mode)" if iteration > 0 else "",
             )
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            raise ValueError(f"SolverAgent did not return valid JSON: {raw}")
+            data = safe_json_loads(raw)
+        except Exception as e:
+            # raise ValueError(f"SolverAgent did not return valid JSON: {raw}")
+            data = _solver_fallback_payload(err_msg=str(e), raw=raw)
         complexity_claim = data.get("complexity_claim", {})
         if not isinstance(complexity_claim, dict):
             complexity_claim = {}
@@ -161,21 +293,58 @@ Problem:\n{question}\n\nTests:{tests}\n\nStarter code:{starter_code}\n\nRetrieve
             "else:\n"
             "    print(mapping.get(data.strip(), ''))\n"
         )
+        
+# PATCH: for handling SolverAgent error raising due to DeepSeek error
+def _solver_fallback_payload(err_msg: str, raw: str = "") -> dict:
+    safe_raw = (raw or "")[:600] 
+    return {
+        "code": (
+            "import sys\n"
+            "def main():\n"
+            "    # Fallback code due to invalid LLM JSON.\n"
+            "    # Intentionally minimal; will likely fail tests.\n"
+            "    data = sys.stdin.read()\n"
+            "    if data is None:\n"
+            "        return\n"
+            "    # print nothing\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        ),
+        "approach": "Fallback: model output could not be parsed as valid JSON.",
+        "assumptions": f"parse_error={err_msg}",
+        "complexity_claim": "N/A",
+        "changed_from_last": True,
+        "debug_raw_prefix": safe_raw,
+    }
 
 
 class CriticAgent:
     def __init__(self, timeout: float = 2.0):
         self.timeout = timeout
 
-    def evaluate(self, code: str, tests: Dict[str, List[str]], question: str) -> CriticResult:
+    def evaluate(self, code=None, tests=None, question=None, **kwargs) -> CriticResult:
+        # Support evaluate(code, tests, question)  (positional)
+        # Support evaluate(code=..., tests=..., question=...) (keyword)
+        if code is None:
+            code = kwargs.get("code")
+        if tests is None:
+            tests = kwargs.get("tests")
+        if question is None:
+            question = kwargs.get("question")
+
+        code = code or ""
+        tests = tests or {"inputs": [], "outputs": []}
+        question = question or ""
+
         complexity_class, evidence = estimate_complexity(code)
         passed, summary, failure_type, notes = self._run_tests(code, tests)
+
         allowed, extra_note = complexity_gate(question, complexity_class)
         if not allowed:
             failure_type = "COMPLEXITY"
             notes = (notes + "; " if notes else "") + extra_note
             passed = False
-        test_summary = summary
+
         suggested_fix = self._suggest_fix(failure_type, notes)
         return CriticResult(
             passed=passed,
@@ -184,7 +353,7 @@ class CriticAgent:
             complexity_class=complexity_class,
             complexity_evidence=evidence,
             suggested_fix=suggested_fix,
-            test_summary=test_summary,
+            test_summary=summary,
         )
 
     def _run_tests(self, code: str, tests: Dict[str, List[str]]):
@@ -208,6 +377,8 @@ class CriticAgent:
             "num_passed": num_passed,
             "first_failure": first_failure,
         }
+        if not inputs or not outputs:
+            return False, {"num_tests": 0, "num_passed": 0, "first_failure": None}, "NO_TESTS", "No tests provided"
         if passed:
             failure_type = "WA"
             notes = ""

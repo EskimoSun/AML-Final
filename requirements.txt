@@ -5,3 +5,5 @@ numpy==1.26.4
 joblib==1.4.2
 datasets==2.19.1
 requests==2.31.0
+openai>=1.0.0
+tqdm
