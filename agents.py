@@ -236,7 +236,7 @@ class SolverAgent:
         retrieval_text = json.dumps(retrieved, ensure_ascii=False, indent=2)
         prompt = f"""
 You are SolverAgent. Write a full Python program for the problem. Use retrieved hints as guidance only. Output strict JSON with keys code, approach, assumptions, complexity_claim, changed_from_last.
-Problem:\n{question}\n\nTests:{tests}\n\nStarter code:{starter_code}\n\nRetrieved hints:{retrieval_text}\n\nPrevious fix request:{prev_fix or ''}
+Problem:\n{question}\n\nStarter code:{starter_code}\n\nRetrieved hints:{retrieval_text}\n\nPrevious fix request:{prev_fix or ''}
 """
         raw = self.llm.complete_with_retry(
             prompt,
@@ -319,8 +319,9 @@ def _solver_fallback_payload(err_msg: str, raw: str = "") -> dict:
 
 
 class CriticAgent:
-    def __init__(self, timeout: float = 2.0):
+    def __init__(self, llm: Optional[LLMClient] = None, timeout: float = 2.0):
         self.timeout = timeout
+        self.llm = llm
 
     def evaluate(self, code=None, tests=None, question=None, **kwargs) -> CriticResult:
         # Support evaluate(code, tests, question)  (positional)
@@ -345,7 +346,7 @@ class CriticAgent:
             notes = (notes + "; " if notes else "") + extra_note
             passed = False
 
-        suggested_fix = self._suggest_fix(failure_type, notes)
+        suggested_fix = self._suggest_fix(failure_type, code, notes)
         return CriticResult(
             passed=passed,
             failure_type=failure_type,
@@ -406,7 +407,48 @@ class CriticAgent:
             return False, "WA", "Wrong answer", stdout
         return True, "", "", stdout
 
-    def _suggest_fix(self, failure_type: str, notes: str) -> str:
+    def _suggest_fix(self, failure_type: str, code: str, notes: str) -> str:
+        """Call LLM to create a concise, actionable fix suggestion.
+        Falls back to heuristic messages if no LLM is available or on error.
+        """
+        # If there's no LLM (or it's in mock mode), use the existing heuristics
+        if not self.llm or getattr(self.llm, "mock_mode", True):
+            if failure_type == "WA":
+                return "Review logic against sample tests and ensure outputs match exactly."
+            if failure_type == "RE":
+                return f"Fix runtime error: {notes[:120]}"
+            if failure_type == "TLE":
+                return "Optimize loops/recursion to avoid timeouts."
+            if failure_type == "COMPLEXITY":
+                return "Replace nested loops with linear approach based on constraints."
+            return "Investigate issues from critic feedback."
+
+        # Compose a focused prompt for the LLM
+        safe_code = (code or "")[:4000]
+        prompt = (
+            "You are a helpful code critic. The submission failed its tests.\n"
+            f"Failure type: {failure_type}\n"
+            f"Notes: {notes}\n\n"
+            "Here is the submitted code (truncated if long):\n"
+            f"{safe_code}\n\n"
+            "Provide a short (1-3 sentence) summary of the likely root cause followed by "
+            "2-4 specific, actionable suggestions to fix the code. Keep it concise."
+        )
+        try:
+            resp = self.llm.complete_with_retry(
+                prompt,
+                json_mode=False,
+                temperature=0.2,
+                max_tokens=300,
+                max_retries=1,
+            )
+            if isinstance(resp, str) and resp.strip():
+                return resp.strip()
+        except Exception:
+            # On any LLM error, fall back to heuristics below
+            pass
+
+        # Final fallback heuristics
         if failure_type == "WA":
             return "Review logic against sample tests and ensure outputs match exactly."
         if failure_type == "RE":
@@ -419,7 +461,106 @@ class CriticAgent:
 
 
 class GuiderAgent:
+    def __init__(self, llm: Optional[LLMClient] = None):
+        self.llm = llm
+
     def synthesize(self, traces: List[IterationTrace]) -> Guide:
+        # Fallback (existing) behaviour when no LLM is available or in mock mode
+        if not self.llm or getattr(self.llm, "mock_mode", True):
+            steps = []
+            for t in traces:
+                steps.append(
+                    {
+                        "iteration": t.iteration,
+                        "what_failed_or_risk": t.critic.failure_type if not t.critic.passed else "OK",
+                        "what_we_changed": t.solver.changed_from_last or "Initial attempt",
+                        "evidence": t.critic.notes or json.dumps(t.critic.test_summary),
+                        "complexity_before_after": {
+                            "before": t.solver.complexity_claim.get("time", "unknown"),
+                            "after": t.critic.complexity_class,
+                        },
+                    }
+                )
+            pitfalls = ["Keep outputs normalized (trim trailing spaces)", "Watch complexity gates for large N"]
+            final_complexity = {
+                "time": traces[-1].critic.complexity_class if traces else "unknown",
+                "space": traces[-1].solver.complexity_claim.get("space", "unknown") if traces else "unknown",
+            }
+            return Guide(
+                guide_title="How the solution evolved",
+                final_summary="Concise walkthrough of solver and critic iterations.",
+                steps=steps,
+                pitfalls=pitfalls,
+                final_complexity=final_complexity,
+            )
+
+        # When an LLM is available, build a compact trace summary and request structured JSON from it
+        traces_summary = []
+        for t in traces:
+            traces_summary.append(
+                {
+                    "iteration": t.iteration,
+                    "failure": t.critic.failure_type,
+                    "passed": t.critic.passed,
+                    "what_we_changed": t.solver.changed_from_last or "Initial attempt",
+                    "notes": t.critic.notes,
+                    "test_summary": t.critic.test_summary,
+                    "complexity_before_after": {
+                        "before": t.solver.complexity_claim.get("time", "unknown"),
+                        "after": t.critic.complexity_class,
+                    },
+                }
+            )
+
+        prompt = (
+            "You are a helpful summarizer that generates a concise guide from solver/critic traces. Output strict JSON.\n"
+            "Input: a list of traces, each with iteration, failure, passed, what_we_changed, notes, test_summary, complexity_before_after.\n"
+            "Produce a JSON object with keys: guide_title (string), final_summary (string), steps (list of objects with keys iteration, what_failed_or_risk, what_we_changed, evidence, complexity_before_after), pitfalls (list of strings), final_complexity (object with time and space).\n"
+            "Traces (JSON):\n"
+            f"{json.dumps(traces_summary, ensure_ascii=False, indent=2)[:8000]}\n\n"
+            "Return only JSON. Keep outputs concise and suitable for programmatic parsing."
+        )
+
+        try:
+            resp = self.llm.complete_with_retry(
+                prompt,
+                json_mode=True,
+                temperature=0.2,
+                max_tokens=800,
+                max_retries=1,
+            )
+            # resp should be JSON or JSON-like string; parse robustly
+            data = None
+            if isinstance(resp, str):
+                try:
+                    data = safe_json_loads(resp)
+                except Exception:
+                    data = None
+            elif isinstance(resp, dict):
+                data = resp
+
+            if isinstance(data, dict):
+                steps = data.get("steps") or []
+                pitfalls = data.get("pitfalls") or ["Keep outputs normalized (trim trailing spaces)", "Watch complexity gates for large N"]
+                final_complexity = data.get("final_complexity") or {
+                    "time": traces[-1].critic.complexity_class if traces else "unknown",
+                    "space": traces[-1].solver.complexity_claim.get("space", "unknown") if traces else "unknown",
+                }
+                guide_title = data.get("guide_title", "How the solution evolved")
+                final_summary = data.get("final_summary", "Concise walkthrough of solver and critic iterations.")
+
+                return Guide(
+                    guide_title=guide_title,
+                    final_summary=final_summary,
+                    steps=steps,
+                    pitfalls=pitfalls,
+                    final_complexity=final_complexity,
+                )
+        except Exception:
+            # On any LLM error we fall back to the simple heuristic summary below
+            pass
+
+        # Fallback: previous heuristic behavior
         steps = []
         for t in traces:
             steps.append(
@@ -551,8 +692,8 @@ def run_pipeline(
     starter_code = payload.get("starter_code")
     llm = LLMClient(provider, api_key)
     solver = SolverAgent(llm)
-    critic = CriticAgent(timeout=timeout)
-    guider = GuiderAgent()
+    critic = CriticAgent(llm=llm, timeout=timeout)
+    guider = GuiderAgent(llm=llm)
 
     traces: List[IterationTrace] = []
     prev_fix = None

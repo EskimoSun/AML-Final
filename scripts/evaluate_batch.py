@@ -96,7 +96,6 @@ def _select_eval_problems(
                 cfg,
                 split=split,
                 cache_dir=cache_dir,
-                trust_remote_code=True,
             )
 
             # Use HF shuffle for deterministic ordering within this config
