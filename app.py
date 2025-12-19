@@ -32,15 +32,15 @@ def main():
     with tabs[0]:
         st.subheader("Paste APPS Problem JSON")
         sample_text = st.session_state.get("last_payload", "")
-        payload_text = st.text_area("Problem JSON", sample_text, height=220)
+        payload_text = st.text_area("Problem JSON", sample_text, height=220, key="last_payload")
 
-        provider = st.selectbox("Provider", ["DeepSeek", "OpenAI"], index=0)
-        api_key = st.text_input("API Key", type="password")
-        max_iters = st.number_input("Max iterations", min_value=1, max_value=6, value=3)
-        rag_k = st.number_input("RAG top-k (0 disables retrieval)", min_value=0, max_value=10, value=3)
-        timeout = st.number_input("Timeout per test (sec)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+        provider = st.selectbox("Provider", ["DeepSeek", "OpenAI"], index=0, key="provider")
+        api_key = st.text_input("API Key", type="password", key="api_key")
+        max_iters = st.number_input("Max iterations", min_value=1, max_value=6, value=3, key="max_iters")
+        rag_k = st.number_input("RAG top-k (0 disables retrieval)", min_value=0, max_value=10, value=3, key="rag_k")
+        timeout = st.number_input("Timeout per test (sec)", min_value=0.5, max_value=10.0, value=2.0, step=0.5, key="timeout")
 
-        run_btn = st.button("Run Full Pipeline", type="primary")
+        run_btn = st.button("Run Full Pipeline", type="primary", key="run_btn")
 
         if run_btn:
             try:
