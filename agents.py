@@ -234,10 +234,11 @@ class SolverAgent:
 
     def generate(self, *, question: str, tests: Dict[str, List[str]], retrieved: List[Dict[str, Any]], starter_code: Optional[str], prev_fix: Optional[str], iteration: int) -> SolverResult:
         retrieval_text = json.dumps(retrieved, ensure_ascii=False, indent=2)
-        prompt = f"""
-You are SolverAgent. Write a full Python program for the problem. Use retrieved hints as guidance only. Output strict JSON with keys code, approach, assumptions, complexity_claim, changed_from_last.
-Problem:\n{question}\n\nStarter code:{starter_code}\n\nRetrieved hints:{retrieval_text}\n\nPrevious fix request:{prev_fix or ''}
-"""
+        prompt = "You are SolverAgent. Write a full Python program for the problem. Use retrieved hints as guidance only. Output strict JSON with keys code, approach, assumptions, complexity_claim, changed_from_last.\nProblem:\n{question}" + \
+        f"\n\nTest cases:{tests}" if tests else "" + \
+        f"\n\nStarter code:{starter_code}" if starter_code else "" + \
+        f"\n\nRetrieved hints:{retrieval_text}" if retrieval_text else "" + \
+        f"\n\nCriticAgent suggestions:{prev_fix}" if prev_fix else ""
         raw = self.llm.complete_with_retry(
             prompt,
             json_mode=True,
@@ -444,6 +445,7 @@ class CriticAgent:
             )
             if isinstance(resp, str) and resp.strip():
                 return resp.strip()
+                
         except Exception:
             # On any LLM error, fall back to heuristics below
             pass
