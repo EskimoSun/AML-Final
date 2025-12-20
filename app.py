@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 import streamlit as st
 
-from agents import run_pipeline, parse_problem_payload
+from agents import LLMClient, SolverAgent, CriticAgent, GuiderAgent, IterationTrace, parse_tests, run_pipeline, parse_problem_payload
 from rag_engine import ProblemDatabase
 
 logging.basicConfig(level=logging.INFO)
@@ -32,13 +32,23 @@ def main():
     with tabs[0]:
         st.subheader("Paste APPS Problem JSON")
         sample_text = st.session_state.get("last_payload", "")
-        payload_text = st.text_area("Problem JSON", sample_text, height=220, key="last_payload")
+        payload_text = st.text_area("Problem JSON", sample_text, height=220, key="payload_editor")
 
-        provider = st.selectbox("Provider", ["DeepSeek", "OpenAI"], index=0, key="provider")
-        api_key = st.text_input("API Key", type="password", key="api_key")
+        deepseek_api_key = st.text_input("DeepSeek API Key", type="password", key="deepseek_api_key")
+        openai_api_key = st.text_input("OpenAI API Key", type="password", key="openai_api_key")
+        
+        fetch_api = {
+            "DeepSeek": deepseek_api_key,
+            "OpenAI": openai_api_key
+        }
+        
+        solver_provider = st.selectbox("Solver Provider", ["DeepSeek", "OpenAI"], index=0, key="solver_provider")
+        critic_provider = st.selectbox("Critic Provider", ["DeepSeek", "OpenAI"], index=0, key="critic_provider")
+        guider_provider = st.selectbox("Guider Provider", ["DeepSeek", "OpenAI"], index=0, key="guider_provider")
+        
         max_iters = st.number_input("Max iterations", min_value=1, max_value=6, value=3, key="max_iters")
         rag_k = st.number_input("RAG top-k (0 disables retrieval)", min_value=0, max_value=10, value=3, key="rag_k")
-        timeout = st.number_input("Timeout per test (sec)", min_value=0.5, max_value=10.0, value=2.0, step=0.5, key="timeout")
+        timeout = st.number_input("Timeout per test (sec)", min_value=0.5, max_value=30.0, value=2.0, step=0.5, key="timeout")
 
         run_btn = st.button("Run Full Pipeline", type="primary", key="run_btn")
 
@@ -52,7 +62,8 @@ def main():
             st.session_state["last_payload"] = payload_text
             question = payload.get("question", "") or ""
             st.session_state["last_question"] = question
-
+            
+            retrieved = None
             retrieved_dicts: List[Dict[str, Any]] = []
             if int(rag_k) > 0:
                 if not db_ready:
@@ -62,20 +73,56 @@ def main():
                 retrieved_dicts = [r.__dict__ for r in retrieved]
 
             try:
-                results = run_pipeline(
-                    payload_text=json.dumps(payload),
-                    provider=provider,
-                    api_key=api_key,
-                    retrieved=retrieved_dicts,
-                    max_iters=int(max_iters),
-                    timeout=float(timeout),
-                )
+                tests = parse_tests(payload.get("input_output"))
+                starter_code = payload.get("starter_code")
+                
+                solver = SolverAgent(llm=LLMClient(solver_provider, fetch_api[solver_provider]))
+                critic = CriticAgent(llm=LLMClient(critic_provider, fetch_api[critic_provider]),
+                                     timeout=float(timeout))
+                guider = GuiderAgent(llm=LLMClient(guider_provider, fetch_api[guider_provider]))
+
+                traces: List[IterationTrace] = []
+                prev_fix = None
+                
+                for i in range(int(max_iters)):
+                    solver_result = solver.generate(
+                        question=question,
+                        tests=tests,
+                        retrieved=retrieved_dicts if i == 0 else None,
+                        starter_code=starter_code,
+                        prev_fix=prev_fix,
+                        iteration=i,
+                    )
+                    critic_result = critic.evaluate(solver_result.code, tests, question)
+                    traces.append(
+                        IterationTrace(
+                            iteration=i + 1,
+                            retrieval=retrieved_dicts if i == 0 else [],
+                            solver=solver_result,
+                            critic=critic_result,
+                        )
+                    )
+                    if critic_result.passed and critic_result.failure_type != "COMPLEXITY":
+                        break
+                    prev_fix = critic_result.suggested_fix
+
+                guider_output = guider.synthesize(traces)
+                final_pass = traces[-1].critic.passed and traces[-1].critic.failure_type != "COMPLEXITY"
+                final_code = traces[-1].solver.code
+                
+                results = {
+                    "decision": "PASS" if final_pass else "REJECT",
+                    "final_code": final_code,
+                    "guide": guider_output,
+                    "traces": traces,
+                    "tests": tests,
+                }
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Pipeline failed: {exc}")
                 st.stop()
 
             st.session_state["run_results"] = results
-            st.session_state["retrieved"] = retrieved_dicts
+            st.session_state["retrieved"] = retrieved_dicts if retrieved_dicts else []
         if "run_results" in st.session_state:
             res = st.session_state["run_results"]
             st.success(f"Final Decision: {res['decision']}")
